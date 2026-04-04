@@ -564,7 +564,10 @@ impl Grid<Cell> {
         let threshold = self.lines * 2;
         let keep_hot = max(threshold, self.display_offset + self.lines);
         if self.history_size() > keep_hot {
-            self.compress_old_scrollback(keep_hot);
+            let max_per_call = 500;
+            let excess = self.history_size() - keep_hot;
+            let batch = min(excess, max_per_call);
+            self.compress_old_scrollback(self.history_size() - batch);
         }
     }
 

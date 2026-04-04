@@ -1265,10 +1265,13 @@ mod compressed_search_tests {
     use crate::event::VoidListener;
     use crate::grid::Dimensions;
     use crate::index::{Column, Point};
+    use crate::selection::{Selection, SelectionType};
     use crate::term::Config;
     use crate::term::search::RegexSearch;
     use crate::term::test::TermSize;
     use crate::vte::ansi::Handler;
+
+    use super::{Direction, Match, RegexIter};
 
     /// Build a term with scrollback history that contains a unique marker
     /// string buried deep in the history.
@@ -1393,6 +1396,369 @@ mod compressed_search_tests {
             term.grid().compressed_history_len(),
             0,
             "All compressed rows should have been thawed during search"
+        );
+    }
+
+    fn text_at_match(term: &crate::term::Term<VoidListener>, m: &Match) -> String {
+        term.bounds_to_string(*m.start(), *m.end())
+    }
+
+    fn write_line(term: &mut crate::term::Term<VoidListener>, text: &str) {
+        for c in text.chars() {
+            term.input(c);
+        }
+        term.carriage_return();
+        term.linefeed();
+    }
+
+    fn term_with_three_markers() -> crate::term::Term<VoidListener> {
+        let columns = 40;
+        let screen_lines = 10;
+        let history_limit = 200;
+
+        let mut config = Config::default();
+        config.scrolling_history = history_limit;
+        let size = TermSize::new(columns, screen_lines);
+        let mut term = crate::term::Term::new(config, &size, VoidListener);
+
+        for i in 0..30 {
+            write_line(&mut term, &format!("filler-A-{:04}", i));
+        }
+        write_line(&mut term, "MARKER_ALPHA");
+        for i in 0..30 {
+            write_line(&mut term, &format!("filler-B-{:04}", i));
+        }
+        write_line(&mut term, "MARKER_BETA");
+        for i in 0..30 {
+            write_line(&mut term, &format!("filler-C-{:04}", i));
+        }
+        write_line(&mut term, "MARKER_GAMMA");
+        for i in 0..20 {
+            write_line(&mut term, &format!("filler-D-{:04}", i));
+        }
+
+        term
+    }
+
+    // ---- Highlighting tests: match coordinates point to correct content ----
+
+    #[test]
+    fn match_coordinates_contain_correct_text() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+        assert!(term.grid().compressed_history_len() > 0);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker after auto-thaw");
+
+        let text = text_at_match(&term, &m);
+        assert_eq!(
+            text, "UNIQUE_SEARCH_MARKER_XYZ",
+            "match coordinates should point to the correct content"
+        );
+    }
+
+    #[test]
+    fn match_coordinates_invalidated_by_recompaction() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker");
+
+        assert_eq!(text_at_match(&term, &m), "UNIQUE_SEARCH_MARKER_XYZ");
+        assert_eq!(term.grid().compressed_history_len(), 0);
+
+        // Simulate what Zed's sync() does: recompress scrollback.
+        term.grid_mut().compact_scrollback_if_needed();
+
+        let match_line = m.start().line;
+        let topmost = term.topmost_line();
+        assert!(
+            match_line < topmost,
+            "Match at {:?} should be above hot buffer (topmost={:?}) after recompaction",
+            match_line, topmost
+        );
+    }
+
+    #[test]
+    fn match_coordinates_stable_without_recompaction() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker");
+
+        assert_eq!(
+            text_at_match(&term, &m), "UNIQUE_SEARCH_MARKER_XYZ",
+            "without recompaction, match coordinates should remain valid"
+        );
+
+        let match_line = m.start().line;
+        let topmost = term.topmost_line();
+        assert!(
+            match_line >= topmost,
+            "Match at {:?} should be within hot buffer (topmost={:?}) when not recompacted",
+            match_line, topmost
+        );
+    }
+
+    // ---- RegexIter tests: all matches found with valid coordinates ----
+
+    #[test]
+    fn regex_iter_finds_all_matches_in_compressed_history() {
+        let mut term = term_with_three_markers();
+        term.grid_mut().compress_old_scrollback(10);
+        assert!(term.grid().compressed_history_len() > 0);
+
+        let mut regex = RegexSearch::new("MARKER_(ALPHA|BETA|GAMMA)").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+
+        let matches: Vec<Match> =
+            RegexIter::new(start, end, Direction::Right, &mut term, &mut regex).collect();
+
+        assert_eq!(matches.len(), 3, "should find all three markers");
+        let texts: Vec<String> = matches.iter().map(|m| text_at_match(&term, m)).collect();
+        assert_eq!(texts[0], "MARKER_ALPHA");
+        assert_eq!(texts[1], "MARKER_BETA");
+        assert_eq!(texts[2], "MARKER_GAMMA");
+    }
+
+    #[test]
+    fn regex_iter_matches_invalidated_by_recompaction() {
+        let mut term = term_with_three_markers();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("MARKER_(ALPHA|BETA|GAMMA)").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+
+        let matches: Vec<Match> =
+            RegexIter::new(start, end, Direction::Right, &mut term, &mut regex).collect();
+        assert_eq!(matches.len(), 3);
+
+        // Recompress — this is what Zed's sync() does after search.
+        term.grid_mut().compact_scrollback_if_needed();
+
+        let topmost = term.topmost_line();
+        let invalid_count = matches.iter()
+            .filter(|m| m.start().line < topmost)
+            .count();
+        assert!(
+            invalid_count > 0,
+            "At least one match should be invalidated by recompaction (topmost={:?})",
+            topmost
+        );
+    }
+
+    // ---- Navigation tests: scroll_to_point reaches the match ----
+
+    #[test]
+    fn scroll_to_match_in_thawed_history() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker");
+
+        let match_start = *m.start();
+        term.scroll_to_point(match_start);
+
+        let display_offset = term.grid().display_offset() as i32;
+        let screen_lines = term.screen_lines() as i32;
+        let viewport_top = -display_offset;
+        let viewport_bottom = viewport_top + screen_lines - 1;
+
+        assert!(
+            match_start.line.0 >= viewport_top && match_start.line.0 <= viewport_bottom,
+            "Match at line {} should be in viewport (top={}, bottom={})",
+            match_start.line.0, viewport_top, viewport_bottom
+        );
+    }
+
+    #[test]
+    fn scroll_to_match_fails_after_recompaction() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker");
+
+        let match_start = *m.start();
+
+        // Recompress — simulates Zed's sync().
+        term.grid_mut().compact_scrollback_if_needed();
+
+        term.scroll_to_point(match_start);
+
+        // display_offset is clamped to the (now small) hot history.
+        let display_offset = term.grid().display_offset();
+        let hot_history = term.grid().history_size();
+        assert!(
+            display_offset <= hot_history,
+            "display_offset ({}) should be clamped to hot history ({})",
+            display_offset, hot_history
+        );
+
+        // The match is unreachable — we can't scroll far enough.
+        let viewport_top = -(display_offset as i32);
+        assert!(
+            match_start.line.0 < viewport_top,
+            "Match at line {} should be unreachable (viewport top={})",
+            match_start.line.0, viewport_top
+        );
+    }
+
+    // ---- Selection tests: activate_match produces correct selection ----
+
+    #[test]
+    fn selection_on_match_yields_correct_text() {
+        let mut term = term_with_marker_in_history();
+        term.grid_mut().compress_old_scrollback(10);
+
+        let mut regex = RegexSearch::new("UNIQUE_SEARCH_MARKER_XYZ").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let m = term.regex_search_right(&mut regex, start, end)
+            .expect("should find marker");
+
+        let mut selection = Selection::new(SelectionType::Simple, *m.start(), Direction::Left);
+        selection.update(*m.end(), Direction::Right);
+        term.selection = Some(selection);
+
+        let selected = term.selection_to_string()
+            .expect("selection should produce text");
+        assert_eq!(
+            selected, "UNIQUE_SEARCH_MARKER_XYZ",
+            "selection over match should yield the search term"
+        );
+    }
+
+    // ---- End-to-end test: simulates the full Zed next/prev cycle ----
+
+    /// Simulates the complete Zed search flow:
+    ///   1. Background search: thaw → find matches → release lock
+    ///   2. sync() before update_matches: recompacts (matches still empty)
+    ///   3. update_matches: stores matches + re-thaws
+    ///   4. activate_match(0): creates selection + scroll_to_point
+    ///   5. Verify: match is in viewport, content is correct, selection works
+    ///   6. Advance to next match and verify again
+    #[test]
+    fn end_to_end_next_prev_through_compressed_matches() {
+        let mut term = term_with_three_markers();
+
+        // --- Step 0: compress history to simulate a long-running terminal ---
+        term.grid_mut().compress_old_scrollback(10);
+        let compressed_before = term.grid().compressed_history_len();
+        assert!(compressed_before > 0, "should have compressed rows");
+
+        // --- Step 1: background search thaws and finds all matches ---
+        let mut regex = RegexSearch::new("MARKER_(ALPHA|BETA|GAMMA)").unwrap();
+        let start = Point::new(term.grid().total_topmost_line(), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        let matches: Vec<Match> =
+            RegexIter::new(start, end, Direction::Right, &mut term, &mut regex).collect();
+        assert_eq!(matches.len(), 3);
+        // Search auto-thawed everything.
+        assert_eq!(term.grid().compressed_history_len(), 0);
+
+        // --- Step 2: sync() runs BEFORE update_matches stores results ---
+        // (matches vec is still empty at this point in the real code)
+        term.grid_mut().compact_scrollback_if_needed();
+        assert!(
+            term.grid().compressed_history_len() > 0,
+            "sync() should have recompressed (race window)"
+        );
+
+        // --- Step 3: update_matches stores results + re-thaws ---
+        let compressed = term.grid().compressed_history_len();
+        term.grid_mut().thaw_compressed_history(compressed);
+        assert_eq!(term.grid().compressed_history_len(), 0);
+
+        // Verify the match coordinates survived the compress→thaw cycle.
+        for m in &matches {
+            let line = m.start().line;
+            assert!(
+                line >= term.topmost_line(),
+                "Match at {:?} should be within hot buffer after re-thaw (topmost={:?})",
+                line, term.topmost_line()
+            );
+        }
+        assert_eq!(text_at_match(&term, &matches[0]), "MARKER_ALPHA");
+        assert_eq!(text_at_match(&term, &matches[1]), "MARKER_BETA");
+        assert_eq!(text_at_match(&term, &matches[2]), "MARKER_GAMMA");
+
+        // --- Step 4: activate_match(0) — first "next" press ---
+        let screen_lines = term.screen_lines() as i32;
+
+        // Create selection (what Zed's make_selection does).
+        let mut selection = Selection::new(
+            SelectionType::Simple, *matches[0].start(), Direction::Left,
+        );
+        selection.update(*matches[0].end(), Direction::Right);
+        term.selection = Some(selection);
+
+        // Scroll to the match (what Zed's ScrollToAlacPoint event does).
+        term.scroll_to_point(*matches[0].start());
+
+        // --- Step 5: verify match 0 is in viewport with correct content ---
+        let display_offset = term.grid().display_offset() as i32;
+        let viewport_top = -display_offset;
+        let viewport_bottom = viewport_top + screen_lines - 1;
+        let match0_line = matches[0].start().line.0;
+        assert!(
+            match0_line >= viewport_top && match0_line <= viewport_bottom,
+            "MARKER_ALPHA at line {} should be in viewport [{}, {}]",
+            match0_line, viewport_top, viewport_bottom
+        );
+        assert_eq!(
+            term.selection_to_string().unwrap(), "MARKER_ALPHA",
+            "selection should cover the first match"
+        );
+
+        // --- Step 6: activate_match(2) — jump to last match ---
+        let mut selection = Selection::new(
+            SelectionType::Simple, *matches[2].start(), Direction::Left,
+        );
+        selection.update(*matches[2].end(), Direction::Right);
+        term.selection = Some(selection);
+        term.scroll_to_point(*matches[2].start());
+
+        let display_offset = term.grid().display_offset() as i32;
+        let viewport_top = -display_offset;
+        let viewport_bottom = viewport_top + screen_lines - 1;
+        let match2_line = matches[2].start().line.0;
+        assert!(
+            match2_line >= viewport_top && match2_line <= viewport_bottom,
+            "MARKER_GAMMA at line {} should be in viewport [{}, {}]",
+            match2_line, viewport_top, viewport_bottom
+        );
+        assert_eq!(
+            term.selection_to_string().unwrap(), "MARKER_GAMMA",
+            "selection should cover the third match"
+        );
+
+        // --- Step 7: verify no compaction happened throughout ---
+        // (In real Zed, matches are non-empty so sync() skips compaction.)
+        assert_eq!(
+            term.grid().compressed_history_len(), 0,
+            "compressed history should still be empty (no recompaction while matches active)"
         );
     }
 
