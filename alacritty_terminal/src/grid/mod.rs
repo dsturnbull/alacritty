@@ -2,6 +2,10 @@
 
 use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+use log::debug;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -147,6 +151,119 @@ pub struct Grid<T> {
     /// the ring buffer on demand (e.g. when the user scrolls up).
     #[cfg_attr(feature = "serde", serde(default, skip))]
     compressed_history: Vec<CompactRow>,
+
+    /// Rate-limited logging state for scrollback compression activity.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scrollback_stats: ScrollbackStats,
+}
+
+/// Tracks compression/decompression activity for periodic debug logging.
+///
+/// Accumulates counts and byte estimates between log emissions, then resets.
+/// Emits at most once per second as long as there is activity.
+#[derive(Debug, Clone)]
+struct ScrollbackStats {
+    last_log: Instant,
+    rows_compressed: usize,
+    rows_thawed: usize,
+    rows_resized_on_thaw: usize,
+    resize_from_cols: usize,
+    resize_to_cols: usize,
+}
+
+static SCROLLBACK_LOGGING_ENABLED: AtomicBool = AtomicBool::new(true);
+
+impl Default for ScrollbackStats {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            rows_compressed: 0,
+            rows_thawed: 0,
+            rows_resized_on_thaw: 0,
+            resize_from_cols: 0,
+            resize_to_cols: 0,
+        }
+    }
+}
+
+impl ScrollbackStats {
+    /// Record that rows were compressed.
+    fn record_compress(&mut self, count: usize) {
+        self.rows_compressed += count;
+    }
+
+    /// Record that rows were thawed, with optional resize info.
+    fn record_thaw(&mut self, count: usize, resized: usize, from_cols: usize, to_cols: usize) {
+        self.rows_thawed += count;
+        self.rows_resized_on_thaw += resized;
+        if resized > 0 {
+            self.resize_from_cols = from_cols;
+            self.resize_to_cols = to_cols;
+        }
+    }
+
+    /// Emit a debug log line if at least 1 second has elapsed and there's activity.
+    fn maybe_log(&mut self, hot: usize, compressed: usize, columns: usize, compressed_bytes: usize) {
+        if !SCROLLBACK_LOGGING_ENABLED.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.rows_compressed == 0 && self.rows_thawed == 0 {
+            return;
+        }
+        if self.last_log.elapsed().as_secs() < 1 {
+            return;
+        }
+
+        let total = hot + compressed;
+        let hot_bytes_approx = hot * columns * 24;
+        let compressed_mib = compressed_bytes as f64 / (1024.0 * 1024.0);
+        let hot_mib = hot_bytes_approx as f64 / (1024.0 * 1024.0);
+        let saved_bytes = (compressed * columns * 24).saturating_sub(compressed_bytes);
+        let saved_mib = saved_bytes as f64 / (1024.0 * 1024.0);
+        let ratio = if compressed_bytes > 0 {
+            (compressed * columns * 24) as f64 / compressed_bytes as f64
+        } else {
+            0.0
+        };
+
+        if self.rows_compressed > 0 && self.rows_thawed > 0 {
+            debug!(
+                "[scrollback] compressed {} rows, thawed {} rows ({} resized {} to {} cols) \
+                 hot={} compressed={} total={} compressed_mem={:.1} MiB hot_mem=~{:.1} MiB \
+                 saved={:.1} MiB ratio={:.1}:1",
+                self.rows_compressed, self.rows_thawed,
+                self.rows_resized_on_thaw, self.resize_from_cols, self.resize_to_cols,
+                hot, compressed, total, compressed_mib, hot_mib, saved_mib, ratio,
+            );
+        } else if self.rows_compressed > 0 {
+            debug!(
+                "[scrollback] compressed {} rows hot={} compressed={} total={} \
+                 compressed_mem={:.1} MiB hot_mem=~{:.1} MiB saved={:.1} MiB ratio={:.1}:1",
+                self.rows_compressed,
+                hot, compressed, total, compressed_mib, hot_mib, saved_mib, ratio,
+            );
+        } else {
+            debug!(
+                "[scrollback] thawed {} rows ({} resized {} to {} cols) \
+                 hot={} compressed={} total={} compressed_mem={:.1} MiB hot_mem=~{:.1} MiB",
+                self.rows_thawed,
+                self.rows_resized_on_thaw, self.resize_from_cols, self.resize_to_cols,
+                hot, compressed, total, compressed_mib, hot_mib,
+            );
+        }
+
+        self.rows_compressed = 0;
+        self.rows_thawed = 0;
+        self.rows_resized_on_thaw = 0;
+        self.resize_from_cols = 0;
+        self.resize_to_cols = 0;
+        self.last_log = Instant::now();
+    }
+}
+
+/// Enable or disable scrollback compression debug logging at runtime.
+pub fn set_scrollback_logging(enabled: bool) {
+    SCROLLBACK_LOGGING_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -157,6 +274,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             display_offset: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
+            scrollback_stats: ScrollbackStats::default(),
             lines,
             columns,
             compressed_history: Vec::new(),
@@ -569,6 +687,15 @@ impl Grid<Cell> {
         // Remove compressed rows from the ring buffer.
         self.raw.shrink_lines(to_compress);
         self.display_offset = min(self.display_offset, self.history_size());
+
+        self.scrollback_stats.record_compress(to_compress);
+        let compressed_bytes = self.compressed_history_bytes();
+        self.scrollback_stats.maybe_log(
+            self.history_size(),
+            self.compressed_history.len(),
+            self.columns,
+            compressed_bytes,
+        );
     }
 
     /// Decompress the newest N compressed history rows back into the ring
@@ -582,6 +709,9 @@ impl Grid<Cell> {
         // Make room in the ring buffer for the decompressed rows.
         self.raw.initialize(count, self.columns);
 
+        let mut resized = 0usize;
+        let mut last_old_cols = 0usize;
+
         // The new oldest slots are at the far end of history.
         let new_history = self.history_size();
         for i in 0..count {
@@ -589,10 +719,15 @@ impl Grid<Cell> {
             let mut decompressed = self.compressed_history[compressed_idx].decompress();
 
             // Compressed rows may predate a column resize, so reconcile widths.
+            let old_cols = decompressed.len();
             if decompressed.len() < self.columns {
                 decompressed.grow(self.columns);
+                resized += 1;
+                last_old_cols = old_cols;
             } else if decompressed.len() > self.columns {
                 decompressed.shrink(self.columns);
+                resized += 1;
+                last_old_cols = old_cols;
             }
 
             let line_idx = Line(-((new_history - i) as i32));
@@ -601,6 +736,15 @@ impl Grid<Cell> {
 
         // Remove from compressed storage.
         self.compressed_history.truncate(self.compressed_history.len() - count);
+
+        self.scrollback_stats.record_thaw(count, resized, last_old_cols, self.columns);
+        let compressed_bytes = self.compressed_history_bytes();
+        self.scrollback_stats.maybe_log(
+            self.history_size(),
+            self.compressed_history.len(),
+            self.columns,
+            compressed_bytes,
+        );
     }
 
     /// Automatically compress old scrollback if hot history exceeds the threshold.
