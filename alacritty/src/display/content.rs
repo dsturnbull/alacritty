@@ -41,11 +41,19 @@ impl<'a> RenderableContent<'a> {
     pub fn new<T: EventListener>(
         config: &'a UiConfig,
         display: &'a mut Display,
-        term: &'a Term<T>,
+        term: &'a mut Term<T>,
         search_state: &'a mut SearchState,
     ) -> Self {
         let search = search_state.dfas().map(|dfas| HintMatches::visible_regex_matches(term, dfas));
         let focused_match = search_state.focused_match();
+
+        let hint = if display.hint_state.active() {
+            display.hint_state.update_matches(term);
+            Some(Hint::from(&display.hint_state))
+        } else {
+            None
+        };
+
         let terminal_content = term.renderable_content();
 
         // Find terminal cursor shape.
@@ -65,13 +73,6 @@ impl<'a> RenderableContent<'a> {
         let cursor_point = terminal_content.cursor.point;
         let display_offset = terminal_content.display_offset;
         let cursor_point = term::point_to_viewport(display_offset, cursor_point).unwrap();
-
-        let hint = if display.hint_state.active() {
-            display.hint_state.update_matches(term);
-            Some(Hint::from(&display.hint_state))
-        } else {
-            None
-        };
 
         Self {
             colors: &display.colors,
@@ -521,7 +522,7 @@ impl<'a> HintMatches<'a> {
     }
 
     /// Create from regex matches on term visible part.
-    fn visible_regex_matches<T>(term: &Term<T>, dfas: &mut RegexSearch) -> Self {
+    fn visible_regex_matches<T>(term: &mut Term<T>, dfas: &mut RegexSearch) -> Self {
         let matches = hint::visible_regex_match_iter(term, dfas).collect::<Vec<_>>();
         Self::new(matches)
     }

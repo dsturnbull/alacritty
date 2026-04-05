@@ -781,7 +781,7 @@ impl Display {
         search_state: &mut SearchState,
     ) {
         // Collect renderable content before the terminal is dropped.
-        let mut content = RenderableContent::new(config, self, &terminal, search_state);
+        let mut content = RenderableContent::new(config, self, &mut *terminal, search_state);
         let mut grid_cells = Vec::new();
         for cell in &mut content {
             grid_cells.push(cell);
@@ -1058,7 +1058,7 @@ impl Display {
     /// This will return whether the highlighted hints changed.
     pub fn update_highlighted_hints<T>(
         &mut self,
-        term: &Term<T>,
+        term: &mut Term<T>,
         config: &UiConfig,
         mouse: &Mouse,
         modifiers: ModifiersState,

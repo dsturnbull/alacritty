@@ -704,9 +704,9 @@ mod tests {
             "ssh:git@github.com:user/repo.git",
             "ftp://ftp.example.org",
         ] {
-            let term = mock_term(regular_url);
+            let mut term = mock_term(regular_url);
             let mut regex = RegexSearch::new(URL_REGEX).unwrap();
-            let matches = visible_regex_match_iter(&term, &mut regex).collect::<Vec<_>>();
+            let matches = visible_regex_match_iter(&mut term, &mut regex).collect::<Vec<_>>();
             assert_eq!(
                 matches.len(),
                 1,
@@ -725,9 +725,9 @@ mod tests {
             "http://<script>alert('xss')</script>",
             "mailto:",
         ] {
-            let term = mock_term(url_like);
+            let mut term = mock_term(url_like);
             let mut regex = RegexSearch::new(URL_REGEX).unwrap();
-            let matches = visible_regex_match_iter(&term, &mut regex).collect::<Vec<_>>();
+            let matches = visible_regex_match_iter(&mut term, &mut regex).collect::<Vec<_>>();
             assert!(
                 matches.is_empty(),
                 "Should not match url in string {url_like}, but instead got: {matches:?}"

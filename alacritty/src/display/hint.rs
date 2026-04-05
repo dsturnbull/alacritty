@@ -71,7 +71,7 @@ impl HintState {
     }
 
     /// Update the visible hint matches and key labels.
-    pub fn update_matches<T>(&mut self, term: &Term<T>) {
+    pub fn update_matches<T>(&mut self, term: &mut Term<T>) {
         let hint = match self.hint.as_mut() {
             Some(hint) => hint,
             None => return,
@@ -129,7 +129,7 @@ impl HintState {
     }
 
     /// Handle keyboard input during hint selection.
-    pub fn keyboard_input<T>(&mut self, term: &Term<T>, c: char) -> Option<HintMatch> {
+    pub fn keyboard_input<T>(&mut self, term: &mut Term<T>, c: char) -> Option<HintMatch> {
         match c {
             // Use backspace to remove the last character pressed.
             '\x08' | '\x1f' => {
@@ -231,7 +231,7 @@ impl HintMatch {
     /// changes since the [`HintMatch`] was constructed. The text of the hint might
     /// be different from its original value, but it will **always** be a valid
     /// match for this hint.
-    pub fn text<T>(&self, term: &Term<T>) -> Option<Cow<'_, str>> {
+    pub fn text<T>(&self, term: &mut Term<T>) -> Option<Cow<'_, str>> {
         // Revalidate hyperlink match.
         if let Some(hyperlink) = &self.hyperlink {
             let (validated, bounds) = hyperlink_at(term, *self.bounds.start())?;
@@ -316,7 +316,7 @@ impl HintLabels {
 
 /// Iterate over all visible regex matches.
 pub fn visible_regex_match_iter<'a, T>(
-    term: &'a Term<T>,
+    term: &'a mut Term<T>,
     regex: &'a mut RegexSearch,
 ) -> impl Iterator<Item = Match> + 'a {
     let viewport_start = Line(-(term.grid().display_offset() as i32));
@@ -370,7 +370,7 @@ pub fn visible_unique_hyperlinks_iter<T>(term: &Term<T>) -> impl Iterator<Item =
 
 /// Retrieve the match, if the specified point is inside the content matching the regex.
 fn regex_match_at<T>(
-    term: &Term<T>,
+    term: &mut Term<T>,
     point: Point,
     regex: &mut RegexSearch,
     post_processing: bool,
@@ -387,7 +387,7 @@ fn regex_match_at<T>(
 
 /// Check if there is a hint highlighted at the specified point.
 pub fn highlighted_at<T>(
-    term: &Term<T>,
+    term: &mut Term<T>,
     config: &UiConfig,
     point: Point,
     mouse_mods: ModifiersState,
@@ -458,7 +458,7 @@ struct HintPostProcessor<'a, T> {
     regex: &'a mut RegexSearch,
 
     /// Terminal reference.
-    term: &'a Term<T>,
+    term: &'a mut Term<T>,
 
     /// Next hint match in the iterator.
     next_match: Option<Match>,
@@ -472,7 +472,7 @@ struct HintPostProcessor<'a, T> {
 
 impl<'a, T> HintPostProcessor<'a, T> {
     /// Create a new iterator for an unprocessed match.
-    fn new(term: &'a Term<T>, regex: &'a mut RegexSearch, regex_match: Match) -> Self {
+    fn new(term: &'a mut Term<T>, regex: &'a mut RegexSearch, regex_match: Match) -> Self {
         let mut post_processor = Self {
             next_match: None,
             start: *regex_match.start(),
@@ -637,12 +637,12 @@ mod tests {
 
     #[test]
     fn closed_bracket_does_not_result_in_infinite_iterator() {
-        let term = mock_term(" ) ");
+        let mut term = mock_term(" ) ");
 
         let mut search = RegexSearch::new("[^/ ]").unwrap();
 
         let count = HintPostProcessor::new(
-            &term,
+            &mut term,
             &mut search,
             Point::new(Line(0), Column(1))..=Point::new(Line(0), Column(1)),
         )
@@ -694,10 +694,10 @@ mod tests {
         let content = "I'm a match!\r\n".repeat(4096);
         // The Term returned from this call will have a viewport starting at 0 and ending at 4096.
         // That's good enough for this test, since it only cares about visible content.
-        let term = mock_term(&content);
+        let mut term = mock_term(&content);
         let mut regex = RegexSearch::new("match!").unwrap();
 
         // The iterator should match everything in the viewport.
-        assert_eq!(visible_regex_match_iter(&term, &mut regex).count(), 4096);
+        assert_eq!(visible_regex_match_iter(&mut term, &mut regex).count(), 4096);
     }
 }
