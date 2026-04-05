@@ -842,15 +842,291 @@ fn scroll_display_with_thaw_page_up_incremental() {
 fn scroll_display_with_thaw_bottom_does_not_thaw() {
     let screen = 10;
     let columns = 40;
-    let history = 50;
+    let history = 100;
 
     let mut grid = grid_with_scrollback(screen, columns, history);
-    grid.compress_old_scrollback(10);
+    grid.compress_old_scrollback(20);
     let compressed_before = grid.compressed_history_len();
 
-    // Scrolling to bottom should not thaw anything.
+    // Scroll::Bottom should not thaw anything.
     grid.scroll_display_with_thaw(Scroll::Bottom);
     assert_eq!(grid.display_offset(), 0);
     assert_eq!(grid.compressed_history_len(), compressed_before);
+}
+
+// ---------------------------------------------------------------------------
+// Reproduction test for display_iter OOB after resize + compaction
+//
+// Crash: "index out of bounds: the len is 146 but the index is 146"
+// in GridIterator::next() at grid/mod.rs:745, triggered by the sequence:
+//   TerminalElement::prepaint → set_size(dimensions) → sync()
+// where sync() processes the resize event, compacts scrollback, then
+// calls make_content which consumes display_iter().
+// ---------------------------------------------------------------------------
+
+/// Helper: consume every cell from display_iter, returning the count.
+/// Panics reproduce the crash if the iterator goes out of bounds.
+fn consume_display_iter(grid: &Grid<Cell>) -> usize {
+    grid.display_iter().count()
+}
+
+/// Helper: resize, optionally compact, then consume display_iter.
+/// This mirrors what TerminalElement::prepaint → sync() does.
+fn resize_compact_iterate(
+    grid: &mut Grid<Cell>,
+    new_lines: usize,
+    new_columns: usize,
+    compact: bool,
+) -> usize {
+    grid.resize(true, new_lines, new_columns);
+    if compact {
+        grid.compact_scrollback_if_needed();
+    }
+    consume_display_iter(grid)
+}
+
+#[test]
+fn display_iter_after_shrink_lines_then_compact() {
+    // Shrinking lines pushes rows from screen into history, then compaction
+    // compresses the oldest history. The iterator must stay in bounds.
+    for columns in [10, 80, 146, 147] {
+        for screen in [10, 24, 50] {
+            let history = screen * 5;
+            let mut grid = grid_with_scrollback(screen, columns, history);
+
+            // Shrink to fewer screen lines.
+            let new_lines = screen / 2;
+            let count = resize_compact_iterate(&mut grid, new_lines, columns, true);
+            assert!(count > 0, "columns={columns} screen={screen}");
+        }
+    }
+}
+
+#[test]
+fn display_iter_after_grow_lines_then_compact() {
+    // Growing lines pulls rows from history into screen.
+    for columns in [10, 80, 146] {
+        let screen = 20;
+        let history = 100;
+        let mut grid = grid_with_scrollback(screen, columns, history);
+
+        let new_lines = screen * 2;
+        let count = resize_compact_iterate(&mut grid, new_lines, columns, true);
+        assert!(count > 0, "columns={columns}");
+    }
+}
+
+#[test]
+fn display_iter_after_shrink_columns_then_compact() {
+    // Shrinking columns causes reflow which can add rows to history.
+    // The crash value "146" could be the column count after shrink.
+    for &(old_cols, new_cols) in &[(147, 146), (200, 146), (160, 80), (146, 73)] {
+        let screen = 24;
+        let history = 100;
+        let mut grid = grid_with_scrollback(screen, old_cols, history);
+
+        let count = resize_compact_iterate(&mut grid, screen, new_cols, true);
+        assert!(count > 0, "old={old_cols} new={new_cols}");
+    }
+}
+
+#[test]
+fn display_iter_after_grow_columns_then_compact() {
+    for &(old_cols, new_cols) in &[(80, 146), (73, 146), (146, 200)] {
+        let screen = 24;
+        let history = 100;
+        let mut grid = grid_with_scrollback(screen, old_cols, history);
+
+        let count = resize_compact_iterate(&mut grid, screen, new_cols, true);
+        assert!(count > 0, "old={old_cols} new={new_cols}");
+    }
+}
+
+#[test]
+fn display_iter_after_resize_both_dimensions_then_compact() {
+    // Resize lines AND columns simultaneously, then compact.
+    let screen = 50;
+    let columns = 147;
+    let history = 200;
+    let mut grid = grid_with_scrollback(screen, columns, history);
+
+    // Shrink both.
+    let count = resize_compact_iterate(&mut grid, 30, 146, true);
+    assert!(count > 0);
+
+    // Grow both from the shrunk state.
+    let count = resize_compact_iterate(&mut grid, 50, 200, true);
+    assert!(count > 0);
+
+    // Shrink lines, grow columns.
+    let count = resize_compact_iterate(&mut grid, 25, 250, true);
+    assert!(count > 0);
+}
+
+#[test]
+fn display_iter_scrolled_up_after_resize_and_compact() {
+    // If the user is scrolled up when the resize + compact happens,
+    // display_offset must be properly clamped.
+    let screen = 30;
+    let columns = 146;
+    let history = 200;
+    let mut grid = grid_with_scrollback(screen, columns, history);
+
+    // Scroll to various positions.
+    for scroll_amount in [1, 10, 50, 100, history] {
+        let mut grid = grid_with_scrollback(screen, columns, history);
+        grid.scroll_display(Scroll::Delta(scroll_amount as i32));
+
+        // Shrink lines (pushes more into history, changes display_offset relation).
+        let count = resize_compact_iterate(&mut grid, screen / 2, columns, true);
+        assert!(
+            count > 0,
+            "scroll={scroll_amount} shrink lines"
+        );
+    }
+
+    // Scrolled to top, then resize.
+    let mut grid = grid_with_scrollback(screen, columns, history);
+    grid.scroll_display(Scroll::Top);
+    let count = resize_compact_iterate(&mut grid, screen / 2, columns, true);
+    assert!(count > 0, "scrolled to top, shrink lines");
+
+    // Scrolled to top, shrink columns (reflow can change row count significantly).
+    let mut grid = grid_with_scrollback(screen, columns, history);
+    grid.scroll_display(Scroll::Top);
+    let count = resize_compact_iterate(&mut grid, screen, columns / 2, true);
+    assert!(count > 0, "scrolled to top, shrink columns");
+}
+
+#[test]
+fn display_iter_with_prior_compaction_then_resize() {
+    // Compact first, THEN resize, THEN compact again, then iterate.
+    // This tests the case where compressed history exists during resize.
+    let screen = 24;
+    let columns = 146;
+    let history = 200;
+
+    let mut grid = grid_with_scrollback(screen, columns, history);
+    grid.compact_scrollback_if_needed();
+    assert!(grid.compressed_history_len() > 0);
+
+    // Now resize (columns change triggers reflow which rebuilds all rows).
+    grid.resize(true, screen, 100);
+    grid.compact_scrollback_if_needed();
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+
+    // And resize back wider.
+    grid.resize(true, screen, 146);
+    grid.compact_scrollback_if_needed();
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+}
+
+#[test]
+fn display_iter_repeated_resize_compact_cycles() {
+    // Rapid resize cycles (as happens when dragging a window edge).
+    let mut grid = grid_with_scrollback(40, 146, 300);
+
+    let sizes: Vec<(usize, usize)> = vec![
+        (35, 146), (30, 140), (25, 130), (20, 120),
+        (25, 130), (30, 140), (35, 146), (40, 150),
+        (38, 146), (36, 142), (34, 138), (32, 134),
+    ];
+
+    for (i, &(lines, cols)) in sizes.iter().enumerate() {
+        let count = resize_compact_iterate(&mut grid, lines, cols, true);
+        assert!(count > 0, "cycle {i}: {lines}x{cols}");
+    }
+}
+
+#[test]
+fn display_iter_tiny_grid_after_compact() {
+    // Edge case: very small grid dimensions.
+    // grid_with_scrollback requires columns >= 6 (it computes `n % (columns - 5)`).
+    let mut grid = grid_with_scrollback(5, 10, 50);
+    grid.compact_scrollback_if_needed();
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+
+    // Shrink to minimum viable size.
+    grid.resize(true, 2, 6);
+    grid.compact_scrollback_if_needed();
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+}
+
+#[test]
+fn display_iter_storage_truncation_boundary() {
+    // Force storage truncation by creating large history then compacting
+    // enough that inner.len() > len + MAX_CACHE_SIZE (1000).
+    let screen = 24;
+    let columns = 80;
+    let history = 2000;
+
+    let mut grid = grid_with_scrollback(screen, columns, history);
+    assert_eq!(grid.history_size(), history);
+
+    // Compact aggressively — compress all but threshold rows.
+    grid.compact_scrollback_if_needed();
+
+    // After compaction, storage may have been truncated.
+    // display_iter must still work.
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+
+    // Resize to trigger reflow, compact again.
+    grid.resize(true, screen, columns - 1);
+    grid.compact_scrollback_if_needed();
+    let count = consume_display_iter(&grid);
+    assert!(count > 0);
+}
+
+#[test]
+fn display_iter_after_shrink_lines_to_near_history_boundary() {
+    // Shrink screen lines so that history_size approaches storage.len,
+    // testing the boundary where compaction + display_offset clamping interact.
+    let screen = 50;
+    let columns = 146;
+    let history = 100;
+    let mut grid = grid_with_scrollback(screen, columns, history);
+
+    // Scroll partially up.
+    grid.scroll_display(Scroll::Delta(30));
+
+    // Shrink screen to just a few lines — most of the buffer becomes history.
+    for target_lines in [40, 30, 20, 10, 5, 3] {
+        let mut g = grid.clone();
+        let count = resize_compact_iterate(&mut g, target_lines, columns, true);
+        assert!(count > 0, "target_lines={target_lines}");
+    }
+}
+
+#[test]
+fn display_iter_size_hint_consistent_after_compact() {
+    // The size_hint must match the actual count after compaction,
+    // otherwise Vec::with_capacity + extend (as make_content does) could
+    // interact poorly with iterator state.
+    let screen = 24;
+    let columns = 146;
+    let history = 200;
+
+    let mut grid = grid_with_scrollback(screen, columns, history);
+    grid.compact_scrollback_if_needed();
+
+    let iter = grid.display_iter();
+    let (hint, upper) = iter.size_hint();
+    let actual = iter.count();
+    assert_eq!(hint, actual, "size_hint lower bound mismatch");
+    assert_eq!(upper, Some(actual), "size_hint upper bound mismatch");
+
+    // After resize.
+    grid.resize(true, 15, 100);
+    grid.compact_scrollback_if_needed();
+    let iter = grid.display_iter();
+    let (hint, upper) = iter.size_hint();
+    let actual = iter.count();
+    assert_eq!(hint, actual, "size_hint lower after resize");
+    assert_eq!(upper, Some(actual), "size_hint upper after resize");
 }
 

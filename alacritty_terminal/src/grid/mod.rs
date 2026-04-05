@@ -452,6 +452,45 @@ impl<T> Grid<T> {
     #[inline]
     pub fn cursor_cell(&mut self) -> &mut T {
         let point = self.cursor.point;
+        let cols = self.columns;
+        let lines = self.lines;
+        let history = self.history_size();
+        let topmost = self.topmost_line();
+        let bottommost = self.bottommost_line();
+        let display_offset = self.display_offset;
+        let compressed = self.compressed_history.len();
+        let input_needs_wrap = self.cursor.input_needs_wrap;
+        let raw_len = self.raw.len();
+
+        if point.column.0 >= cols
+            || point.line < topmost
+            || point.line > bottommost
+        {
+            panic!(
+                "cursor_cell() out of bounds.\n\
+                 cursor point:      {:?}\n\
+                 input_needs_wrap:   {}\n\
+                 grid columns:       {}\n\
+                 grid screen_lines:  {}\n\
+                 history_size:       {}\n\
+                 raw.len:            {}\n\
+                 topmost_line:       {:?}\n\
+                 bottommost_line:    {:?}\n\
+                 display_offset:     {}\n\
+                 compressed_history: {}",
+                point,
+                input_needs_wrap,
+                cols,
+                lines,
+                history,
+                raw_len,
+                topmost,
+                bottommost,
+                display_offset,
+                compressed,
+            );
+        }
+
         &mut self[point.line][point.column]
     }
 }
@@ -547,7 +586,15 @@ impl Grid<Cell> {
         let new_history = self.history_size();
         for i in 0..count {
             let compressed_idx = self.compressed_history.len() - count + i;
-            let decompressed = self.compressed_history[compressed_idx].decompress();
+            let mut decompressed = self.compressed_history[compressed_idx].decompress();
+
+            // Compressed rows may predate a column resize, so reconcile widths.
+            if decompressed.len() < self.columns {
+                decompressed.grow(self.columns);
+            } else if decompressed.len() > self.columns {
+                decompressed.shrink(self.columns);
+            }
+
             let line_idx = Line(-((new_history - i) as i32));
             self.raw[line_idx] = decompressed;
         }
@@ -740,6 +787,42 @@ impl<'a, T> Iterator for GridIterator<'a, T> {
                 self.point.line += 1;
             },
             _ => self.point.column += Column(1),
+        }
+
+        // Diagnostic guard: verify the point is within grid bounds before
+        // indexing. If this fires, the log line contains the state needed
+        // to write a reproduction test for the OOB crash.
+        let lines_in_buffer = self.grid.total_lines();
+        let history = self.grid.history_size();
+        let screen = self.grid.screen_lines();
+        let cols = self.grid.columns();
+        let topmost = self.grid.topmost_line();
+        let bottommost = self.grid.bottommost_line();
+
+        if self.point.line < topmost
+            || self.point.line > bottommost
+            || self.point.column.0 >= cols
+        {
+            panic!(
+                "GridIterator::next() about to access out-of-bounds point.\n\
+                 point:          {:?}\n\
+                 end:            {:?}\n\
+                 grid lines:     {} (screen={}, history={}, buffer={})\n\
+                 grid columns:   {}\n\
+                 topmost_line:   {:?}\n\
+                 bottommost_line:{:?}\n\
+                 display_offset: {}",
+                self.point,
+                self.end,
+                screen + history,
+                screen,
+                history,
+                lines_in_buffer,
+                cols,
+                topmost,
+                bottommost,
+                self.grid.display_offset(),
+            );
         }
 
         Some(Indexed { cell: &self.grid[self.point], point: self.point })

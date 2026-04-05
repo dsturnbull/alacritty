@@ -3358,4 +3358,593 @@ mod tests {
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
     }
+
+    #[test]
+    fn renderable_content_fuzz_operation_sequences() {
+        // Brute-force search for the edge case by trying many combinations
+        // of operations that can occur during TerminalElement::prepaint.
+        //
+        // The crash is "index out of bounds: the len is 146 but the index
+        // is 146" in GridIterator::next(), triggered during sync() which
+        // processes resize events, compacts scrollback, then iterates via
+        // renderable_content().
+        //
+        // We try every combination of:
+        //   - initial column counts (including 146, 147)
+        //   - initial screen line counts
+        //   - scroll positions
+        //   - resize targets (lines and columns)
+        //   - with/without prior compaction
+        //   - with/without intermediate newlines (PTY output)
+
+        let column_counts = [80, 146, 147];
+        let screen_lines = [10, 24, 50];
+        let history_sizes = [0, 10, 50, 200];
+        let scroll_amounts: &[i32] = &[0, 1, 10, 50, 100, i32::MAX]; // MAX = scroll to top
+        let resize_targets: &[(usize, usize)] = &[
+            // (new_lines, new_cols)
+            (5, 73),
+            (10, 80),
+            (10, 146),
+            (15, 146),
+            (24, 146),
+            (24, 147),
+            (30, 200),
+            (50, 146),
+            (3, 146),
+            (24, 10),
+        ];
+
+        for &cols in &column_counts {
+            for &screen in &screen_lines {
+                for &history in &history_sizes {
+                    for &scroll in scroll_amounts {
+                        for &(new_lines, new_cols) in resize_targets {
+                            for prior_compact in [false, true] {
+                                for extra_newlines in [0usize, 20] {
+                                    // Build a term with scrollback.
+                                    let mut term = if history > 0 {
+                                        term_with_scrollback(screen, cols, history)
+                                    } else {
+                                        let size = TermSize::new(cols, screen);
+                                        Term::new(Config::default(), &size, VoidListener)
+                                    };
+
+                                    // Optionally compact before other operations.
+                                    if prior_compact && history > 0 {
+                                        term.grid_mut().compact_scrollback_if_needed();
+                                    }
+
+                                    // Scroll (use scroll_display_with_thaw to
+                                    // exercise the thaw path when compressed
+                                    // rows exist).
+                                    if scroll == i32::MAX {
+                                        term.grid_mut()
+                                            .scroll_display_with_thaw(Scroll::Top);
+                                    } else if scroll > 0 {
+                                        term.grid_mut()
+                                            .scroll_display_with_thaw(Scroll::Delta(scroll));
+                                    }
+
+                                    // Simulate PTY output arriving between
+                                    // scroll and resize.
+                                    if extra_newlines > 0 {
+                                        // Scroll back to bottom first (as
+                                        // terminal input does).
+                                        term.grid_mut().scroll_display(Scroll::Bottom);
+                                        for _ in 0..extra_newlines {
+                                            term.newline();
+                                        }
+                                    }
+
+                                    // Resize (as set_size → process_terminal_event does).
+                                    term.resize(TermSize::new(new_cols, new_lines));
+
+                                    // Compact (as sync does after processing events).
+                                    term.grid_mut().compact_scrollback_if_needed();
+
+                                    // Exercise the exact code path that crashes:
+                                    // renderable_content → display_iter + cursor access.
+                                    exercise_renderable_content(&term);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renderable_content_fuzz_double_resize() {
+        // Two resize events processed back-to-back in the same sync() call,
+        // as happens when the event queue has multiple pending resizes.
+        let column_counts = [80, 146, 147];
+        let screen_lines = [10, 24, 50];
+
+        let resize_pairs: &[((usize, usize), (usize, usize))] = &[
+            ((30, 146), (15, 146)),   // shrink lines twice
+            ((15, 146), (30, 146)),   // shrink then grow
+            ((24, 100), (24, 146)),   // shrink cols then grow cols
+            ((24, 200), (24, 146)),   // grow cols then shrink cols
+            ((30, 100), (15, 146)),   // shrink both then different shrink
+            ((15, 200), (30, 80)),    // shrink+grow then grow+shrink
+            ((10, 73), (50, 200)),    // small then large
+            ((3, 10), (50, 200)),     // tiny then large
+        ];
+
+        for &cols in &column_counts {
+            for &screen in &screen_lines {
+                let history = 200;
+                for &((l1, c1), (l2, c2)) in resize_pairs {
+                    let mut term = term_with_scrollback(screen, cols, history);
+
+                    // Scroll up partway.
+                    term.scroll_display(Scroll::Delta(30));
+
+                    // First resize (no compact between — both events in same sync).
+                    term.resize(TermSize::new(c1, l1));
+
+                    // Second resize.
+                    term.resize(TermSize::new(c2, l2));
+
+                    // Compact + iterate (end of sync).
+                    term.grid_mut().compact_scrollback_if_needed();
+                    exercise_renderable_content(&term);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renderable_content_fuzz_scroll_between_resizes() {
+        // Scroll event sandwiched between two resize events in the queue.
+        let cols = 146;
+        let screen = 24;
+        let history = 200;
+
+        for scroll in [Scroll::Delta(10), Scroll::Delta(50), Scroll::Top, Scroll::PageUp] {
+            for &(l1, c1) in &[(12, 146), (24, 73), (30, 200)] {
+                for &(l2, c2) in &[(24, 146), (12, 146), (24, 200)] {
+                    let mut term = term_with_scrollback(screen, cols, history);
+
+                    // First resize.
+                    term.resize(TermSize::new(c1, l1));
+
+                    // Scroll (between resizes in the event queue).
+                    term.grid_mut().scroll_display_with_thaw(scroll);
+
+                    // Second resize.
+                    term.resize(TermSize::new(c2, l2));
+
+                    // Compact + iterate.
+                    term.grid_mut().compact_scrollback_if_needed();
+                    exercise_renderable_content(&term);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn renderable_content_fuzz_clear_then_resize_compact() {
+        // Clear screen (InternalEvent::Clear equivalent) then resize + compact.
+        for &cols in &[80, 146, 147] {
+            let screen = 24;
+            let history = 100;
+
+            let mut term = term_with_scrollback(screen, cols, history);
+            term.scroll_display(Scroll::Delta(20));
+
+            // Clear saved scrollback.
+            term.clear_screen(ansi::ClearMode::Saved);
+
+            // Resize.
+            term.resize(TermSize::new(cols, screen / 2));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_fuzz_alt_screen_round_trip() {
+        // Enter alt screen, resize, leave alt screen, compact, iterate.
+        // The alt screen swap changes which grid is active.
+        for &cols in &[80, 146] {
+            let screen = 24;
+            let history = 100;
+
+            let mut term = term_with_scrollback(screen, cols, history);
+            term.scroll_display(Scroll::Delta(20));
+
+            // Enter alt screen.
+            term.set_private_mode(
+                ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor.into(),
+            );
+
+            // Resize while in alt screen.
+            term.resize(TermSize::new(cols, screen / 2));
+
+            // Leave alt screen.
+            term.unset_private_mode(
+                ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor.into(),
+            );
+
+            // Compact + iterate on the primary grid.
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_fuzz_input_at_boundary_then_resize() {
+        // Write characters that push the cursor to the last column
+        // (input_needs_wrap = true), then resize columns smaller.
+        // This tests cursor clamping during column resize.
+        for &cols in &[80, 146, 147] {
+            let screen = 24;
+            let history = 100;
+
+            let mut term = term_with_scrollback(screen, cols, history);
+
+            // Fill the current line completely to set input_needs_wrap.
+            for col in 0..cols {
+                let c = (b'A' + (col % 26) as u8) as char;
+                term.input(c);
+            }
+
+            // Now resize to fewer columns.
+            term.resize(TermSize::new(cols - 1, screen));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+
+            // And resize to 146 specifically.
+            term.resize(TermSize::new(146, screen));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reproduction tests for display_iter OOB after resize + compaction.
+    //
+    // Crash: "index out of bounds: the len is 146 but the index is 146"
+    // in GridIterator::next(), triggered by the sequence:
+    //   TerminalElement::prepaint → set_size → sync → make_content
+    // where sync processes the resize, compacts scrollback, then calls
+    // renderable_content() which creates and consumes display_iter().
+    // -----------------------------------------------------------------------
+
+    /// Helper that mimics Zed's `make_content`: consume display_iter via
+    /// size_hint + extend, then access the cursor cell — exactly the code
+    /// path that panics in the crash report.
+    fn exercise_renderable_content(term: &Term<VoidListener>) {
+        let content = term.renderable_content();
+
+        let estimated_size = content.display_iter.size_hint().0;
+        let mut cells: Vec<(Point, Cell)> = Vec::with_capacity(estimated_size);
+        cells.extend(content.display_iter.map(|ic| (ic.point, ic.cell.clone())));
+
+        // This is the `cursor_char` access from Zed's make_content.
+        let _cursor_char = term.grid()[content.cursor.point].c;
+    }
+
+    /// Build a Term with `history_lines` of scrollback filled with
+    /// identifiable content, to exercise compression and iteration.
+    fn term_with_scrollback(
+        screen_lines: usize,
+        columns: usize,
+        history_lines: usize,
+    ) -> Term<VoidListener> {
+        let size = TermSize::new(columns, screen_lines);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Write content and scroll to create history.
+        for n in 0..history_lines {
+            // Fill the current line with some characters.
+            let num_chars = std::cmp::min(columns, 5 + (n % columns.saturating_sub(4).max(1)));
+            let cursor_line = term.grid.cursor.point.line;
+            for col in 0..num_chars {
+                let c = (b'!' + ((n + col) % 94) as u8) as char;
+                term.grid_mut()[cursor_line][Column(col)].c = c;
+            }
+            term.newline();
+        }
+
+        term
+    }
+
+    #[test]
+    fn renderable_content_after_shrink_lines_and_compact() {
+        for columns in [10, 80, 146, 147, 200] {
+            for screen in [10, 24, 50] {
+                let history = screen * 5;
+                let mut term = term_with_scrollback(screen, columns, history);
+
+                let new_lines = screen / 2;
+                let new_size = TermSize::new(columns, new_lines);
+                term.resize(new_size);
+                term.grid_mut().compact_scrollback_if_needed();
+
+                exercise_renderable_content(&term);
+            }
+        }
+    }
+
+    #[test]
+    fn renderable_content_after_grow_lines_and_compact() {
+        for columns in [10, 80, 146] {
+            let screen = 20;
+            let history = 100;
+            let mut term = term_with_scrollback(screen, columns, history);
+
+            let new_size = TermSize::new(columns, screen * 2);
+            term.resize(new_size);
+            term.grid_mut().compact_scrollback_if_needed();
+
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_after_shrink_columns_and_compact() {
+        // The crash value "146" could be the column count after shrink.
+        for &(old_cols, new_cols) in &[(147, 146), (200, 146), (160, 80), (146, 73)] {
+            let screen = 24;
+            let history = 100;
+            let mut term = term_with_scrollback(screen, old_cols, history);
+
+            let new_size = TermSize::new(new_cols, screen);
+            term.resize(new_size);
+            term.grid_mut().compact_scrollback_if_needed();
+
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_after_grow_columns_and_compact() {
+        for &(old_cols, new_cols) in &[(80, 146), (73, 146), (146, 200)] {
+            let screen = 24;
+            let history = 100;
+            let mut term = term_with_scrollback(screen, old_cols, history);
+
+            let new_size = TermSize::new(new_cols, screen);
+            term.resize(new_size);
+            term.grid_mut().compact_scrollback_if_needed();
+
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_after_resize_both_dims_and_compact() {
+        let screen = 50;
+        let columns = 147;
+        let history = 200;
+        let mut term = term_with_scrollback(screen, columns, history);
+
+        // Shrink both.
+        term.resize(TermSize::new(146, 30));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Grow both from the shrunk state.
+        term.resize(TermSize::new(200, 50));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Shrink lines, grow columns.
+        term.resize(TermSize::new(250, 25));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_scrolled_up_after_resize_and_compact() {
+        let screen = 30;
+        let columns = 146;
+        let history = 200;
+
+        for scroll_amount in [1, 10, 50, 100, history as i32] {
+            let mut term = term_with_scrollback(screen, columns, history);
+            term.scroll_display(Scroll::Delta(scroll_amount));
+
+            // Shrink lines.
+            term.resize(TermSize::new(columns, screen / 2));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+
+        // Scrolled to top, then resize.
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.scroll_display(Scroll::Top);
+        term.resize(TermSize::new(columns, screen / 2));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Scrolled to top, shrink columns (reflow can change row count).
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.scroll_display(Scroll::Top);
+        term.resize(TermSize::new(columns / 2, screen));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_with_prior_compaction_then_resize() {
+        let screen = 24;
+        let columns = 146;
+        let history = 200;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.grid_mut().compact_scrollback_if_needed();
+        assert!(term.grid().compressed_history_len() > 0);
+
+        // Resize columns (triggers full reflow, rebuilds all rows).
+        term.resize(TermSize::new(100, screen));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Resize back wider.
+        term.resize(TermSize::new(146, screen));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_repeated_resize_compact_cycles() {
+        // Simulate rapid resize cycles (dragging a window edge).
+        let mut term = term_with_scrollback(40, 146, 300);
+
+        let sizes: Vec<(usize, usize)> = vec![
+            (35, 146), (30, 140), (25, 130), (20, 120),
+            (25, 130), (30, 140), (35, 146), (40, 150),
+            (38, 146), (36, 142), (34, 138), (32, 134),
+        ];
+
+        for &(lines, cols) in &sizes {
+            term.resize(TermSize::new(cols, lines));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_tiny_grid_after_compact() {
+        let mut term = term_with_scrollback(5, 10, 50);
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Shrink to minimum viable size.
+        term.resize(TermSize::new(6, 2));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_storage_truncation_boundary() {
+        // Force storage truncation by creating large history then compacting
+        // enough that inner.len() > len + MAX_CACHE_SIZE (1000).
+        let screen = 24;
+        let columns = 80;
+        let history = 2000;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+
+        // Resize to trigger reflow, compact again.
+        term.resize(TermSize::new(columns - 1, screen));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_near_history_boundary() {
+        let screen = 50;
+        let columns = 146;
+        let history = 100;
+
+        // Shrink to progressively fewer lines, each from a fresh term
+        // scrolled partially up.
+        for target_lines in [40, 30, 20, 10, 5, 3] {
+            let mut term = term_with_scrollback(screen, columns, history);
+            term.scroll_display(Scroll::Delta(30));
+            term.resize(TermSize::new(columns, target_lines));
+            term.grid_mut().compact_scrollback_if_needed();
+            exercise_renderable_content(&term);
+        }
+    }
+
+    #[test]
+    fn renderable_content_scroll_events_then_resize_then_compact() {
+        // Simulate the event queue having scroll events before a resize,
+        // as happens when the user scrolls while the window is being resized.
+        let screen = 30;
+        let columns = 146;
+        let history = 200;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+
+        // Process scroll events (as sync would).
+        term.grid_mut().scroll_display_with_thaw(Scroll::Delta(50));
+
+        // Then resize (as sync would after processing the scroll).
+        term.resize(TermSize::new(columns, screen / 2));
+
+        // Then compact + iterate (as sync's tail does).
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_scroll_to_top_resize_compact() {
+        // Scroll to top of total history (thawing compressed rows),
+        // then resize, compact, iterate.
+        let screen = 24;
+        let columns = 146;
+        let history = 200;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+
+        // Compact first to create compressed rows.
+        term.grid_mut().compact_scrollback_if_needed();
+        let compressed = term.grid().compressed_history_len();
+        assert!(compressed > 0);
+
+        // Scroll to absolute top (thaws compressed history).
+        term.grid_mut().scroll_display_with_thaw(Scroll::Top);
+
+        // Now resize.
+        term.resize(TermSize::new(columns, screen / 2));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_after_newlines_during_compact_window() {
+        // Write new content after compaction (simulates ongoing PTY output).
+        let screen = 24;
+        let columns = 146;
+        let history = 200;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.grid_mut().compact_scrollback_if_needed();
+
+        // Simulate more PTY output arriving.
+        for _ in 0..50 {
+            term.newline();
+        }
+
+        // Resize and compact again.
+        term.resize(TermSize::new(columns, screen / 2));
+        term.grid_mut().compact_scrollback_if_needed();
+        exercise_renderable_content(&term);
+    }
+
+    #[test]
+    fn renderable_content_size_hint_matches_count_after_compact() {
+        let screen = 24;
+        let columns = 146;
+        let history = 200;
+
+        let mut term = term_with_scrollback(screen, columns, history);
+        term.grid_mut().compact_scrollback_if_needed();
+
+        let content = term.renderable_content();
+        let (hint, upper) = content.display_iter.size_hint();
+        let actual = content.display_iter.count();
+        assert_eq!(hint, actual, "size_hint lower bound mismatch");
+        assert_eq!(upper, Some(actual), "size_hint upper bound mismatch");
+
+        // After resize.
+        term.resize(TermSize::new(100, 15));
+        term.grid_mut().compact_scrollback_if_needed();
+
+        let content = term.renderable_content();
+        let (hint, upper) = content.display_iter.size_hint();
+        let actual = content.display_iter.count();
+        assert_eq!(hint, actual, "size_hint lower after resize");
+        assert_eq!(upper, Some(actual), "size_hint upper after resize");
+    }
 }
