@@ -5,7 +5,7 @@
 //! Supported transmission mediums:
 //! - `Direct` (`t=d`): inline base64 payload
 //! - `File` (`t=f`): base64-encoded file path
-//! - `TempFile` (`t=t`): base64-encoded path relative to temp dir
+//! - `TempFile` (`t=t`): base64-encoded absolute or relative path; canonicalized and verified within a known temp dir
 //! - `SharedMemory` (`t=s`): base64-encoded POSIX shm object name (unix only)
 
 use std::io::Read;
@@ -100,9 +100,12 @@ fn decode_direct_payload(raw_payload: &[u8]) -> Result<Vec<u8>, DecodeError> {
 
 /// Read payload from a file path (Medium::File or Medium::TempFile).
 ///
-/// The `raw_payload` is a base64-encoded filesystem path. For TempFile,
-/// the decoded path is joined relative to `std::env::temp_dir()` and must
-/// not contain `..` components or escape the temp directory.
+/// For TempFile, absolute paths are used as-is and relative paths are joined
+/// with `std::env::temp_dir()`. The result is canonicalized via
+/// `std::fs::canonicalize` (resolves symlinks and `..` safely), then verified
+/// to lie within a known temp directory. The file must be a regular file.
+/// Deletion occurs only when the path contains `"tty-graphics-protocol"` and
+/// the file is within a known temp directory, matching kitty's behavior.
 fn read_file_payload(
     raw_payload: &[u8],
     data_offset: u32,
@@ -118,12 +121,27 @@ fn read_file_payload(
         .map_err(|e| DecodeError::IoError(format!("invalid UTF-8 in path: {e}")))?;
 
     let resolved_path = if is_temp {
-        validate_temp_path(&path_str)?;
-        let temp_dir = std::env::temp_dir();
-        temp_dir.join(&path_str)
+        let raw = std::path::Path::new(&path_str);
+        let candidate =
+            if raw.is_absolute() { raw.to_path_buf() } else { std::env::temp_dir().join(&path_str) };
+        let canonical = std::fs::canonicalize(&candidate)
+            .map_err(|e| DecodeError::IoError(format!("canonicalize {:?}: {e}", candidate)))?;
+        if !known_temp_dirs().iter().any(|d| canonical.starts_with(d)) {
+            return Err(DecodeError::PathTraversal(format!(
+                "temp file resolves outside temp dir: {:?}",
+                canonical
+            )));
+        }
+        canonical
     } else {
         std::path::PathBuf::from(&path_str)
     };
+
+    let metadata = std::fs::metadata(&resolved_path)
+        .map_err(|e| DecodeError::IoError(format!("stat {:?}: {e}", resolved_path)))?;
+    if !metadata.file_type().is_file() {
+        return Err(DecodeError::IoError(format!("not a regular file: {:?}", resolved_path)));
+    }
 
     let mut file = std::fs::File::open(&resolved_path)
         .map_err(|e| DecodeError::IoError(format!("open {:?}: {e}", resolved_path)))?;
@@ -145,52 +163,51 @@ fn read_file_payload(
         buf
     };
 
-    // For temp files, delete after reading (kitty/wezterm behavior).
-    if is_temp {
+    // Delete only when the path contains "tty-graphics-protocol" and is within
+    // a known temp dir — matching kitty's conditional cleanup behavior.
+    if is_temp
+        && path_str.contains("tty-graphics-protocol")
+        && known_temp_dirs().iter().any(|d| resolved_path.starts_with(d))
+    {
         if let Err(e) = std::fs::remove_file(&resolved_path) {
-            log::warn!(
-                "[kitty] failed to remove temp file {:?}: {e}",
-                resolved_path
-            );
+            log::warn!("[kitty] failed to remove temp file {:?}: {e}", resolved_path);
         }
     }
 
     Ok(data)
 }
 
-/// Validate that a temp-file relative path does not escape the temp directory.
+/// Returns a deduplicated list of canonical known temp directories.
 ///
-/// Rejects paths containing `..` components, absolute paths, and any other
-/// attempt to traverse outside the temp dir.
-fn validate_temp_path(path: &str) -> Result<(), DecodeError> {
-    use std::path::Component;
+/// Covers platform differences: on macOS, `temp_dir()` returns `$TMPDIR`
+/// (e.g. `/var/folders/.../T/`) while many tools write to `/tmp` (which
+/// resolves to `/private/tmp`). Both are included on Unix.
+fn known_temp_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
 
-    let path_obj = std::path::Path::new(path);
-
-    // Reject absolute paths — temp file paths must be relative.
-    if path_obj.is_absolute() {
-        return Err(DecodeError::PathTraversal(format!(
-            "absolute path not allowed for temp file: {path}"
-        )));
+    if let Ok(d) = std::fs::canonicalize(std::env::temp_dir()) {
+        dirs.push(d);
     }
 
-    for component in path_obj.components() {
-        match component {
-            Component::ParentDir => {
-                return Err(DecodeError::PathTraversal(format!(
-                    "path contains '..': {path}"
-                )));
-            },
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(DecodeError::PathTraversal(format!(
-                    "path escapes temp directory: {path}"
-                )));
-            },
-            Component::CurDir | Component::Normal(_) => {},
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::canonicalize("/tmp") {
+        dirs.push(d);
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Ok(d) = std::fs::canonicalize("/dev/shm") {
+        dirs.push(d);
+    }
+
+    if let Ok(s) = std::env::var("TMPDIR") {
+        if let Ok(d) = std::fs::canonicalize(&s) {
+            dirs.push(d);
         }
     }
 
-    Ok(())
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 /// Read payload from a POSIX shared memory object (Medium::SharedMemory).
@@ -765,7 +782,8 @@ mod tests {
         let pixels: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 255];
 
         let temp_dir = std::env::temp_dir();
-        let file_name = format!("kitty_test_tempfile_{}", std::process::id());
+        // Name must contain "tty-graphics-protocol" for deletion to occur (kitty spec).
+        let file_name = format!("tty-graphics-protocol-test-{}", std::process::id());
         let file_path = temp_dir.join(&file_name);
         {
             let mut f = std::fs::File::create(&file_path).unwrap();
@@ -774,7 +792,6 @@ mod tests {
 
         assert!(file_path.exists(), "temp file should exist before decode");
 
-        // For TempFile, the payload is the base64-encoded *relative* path (filename only).
         let path_b64 = BASE64.encode(file_name.as_bytes());
         let cmd = KittyCommand {
             format: Format::Rgba,
@@ -788,54 +805,77 @@ mod tests {
         let data = decode_payload(&cmd, &cmd.payload).unwrap();
         assert_eq!(data.pixels, pixels);
 
-        // TempFile medium should delete the file after reading.
         assert!(!file_path.exists(), "temp file should be deleted after decode");
     }
 
     #[test]
-    fn decode_tempfile_rejects_parent_dir_traversal() {
-        let evil_path = "../etc/passwd";
-        let path_b64 = BASE64.encode(evil_path.as_bytes());
+    fn decode_tempfile_not_deleted_without_protocol_name() {
+        use std::io::Write;
+
+        let pixels: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 255];
+
+        let temp_dir = std::env::temp_dir();
+        let file_name = format!("kitty_test_nodelete_{}", std::process::id());
+        let file_path = temp_dir.join(&file_name);
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.write_all(&pixels).unwrap();
+        }
+
+        let path_b64 = BASE64.encode(file_name.as_bytes());
         let cmd = KittyCommand {
             format: Format::Rgba,
             medium: Medium::TempFile,
-            width: 1,
+            width: 2,
             height: 1,
             payload: path_b64.into_bytes(),
             ..Default::default()
         };
 
-        let err = decode_payload(&cmd, &cmd.payload).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::PathTraversal(_)),
-            "expected PathTraversal error, got: {err}"
-        );
+        let data = decode_payload(&cmd, &cmd.payload).unwrap();
+        assert_eq!(data.pixels, pixels);
+
+        // File name lacks "tty-graphics-protocol" — must not be deleted.
+        assert!(file_path.exists(), "file should NOT be deleted when name lacks tty-graphics-protocol");
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
-    fn decode_tempfile_rejects_double_dot_in_middle() {
-        let evil_path = "subdir/../../etc/passwd";
-        let path_b64 = BASE64.encode(evil_path.as_bytes());
+    fn decode_tempfile_accepts_absolute_path() {
+        use std::io::Write;
+
+        let pixels: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 255];
+
+        let temp_dir = std::env::temp_dir();
+        let file_name = format!("kitty_test_abspath_{}", std::process::id());
+        let file_path = temp_dir.join(&file_name);
+        {
+            let mut f = std::fs::File::create(&file_path).unwrap();
+            f.write_all(&pixels).unwrap();
+        }
+
+        // Pass the full absolute path — previously rejected, now allowed.
+        let abs_path = file_path.to_str().unwrap();
+        let path_b64 = BASE64.encode(abs_path.as_bytes());
         let cmd = KittyCommand {
             format: Format::Rgba,
             medium: Medium::TempFile,
-            width: 1,
+            width: 2,
             height: 1,
             payload: path_b64.into_bytes(),
             ..Default::default()
         };
 
-        let err = decode_payload(&cmd, &cmd.payload).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::PathTraversal(_)),
-            "expected PathTraversal error, got: {err}"
-        );
+        let data = decode_payload(&cmd, &cmd.payload).unwrap();
+        assert_eq!(data.pixels, pixels);
+
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
-    fn decode_tempfile_rejects_absolute_path() {
-        let evil_path = "/etc/passwd";
-        let path_b64 = BASE64.encode(evil_path.as_bytes());
+    fn decode_tempfile_rejects_path_outside_tmp() {
+        // /etc/passwd is outside any known temp dir — must be rejected.
+        let path_b64 = BASE64.encode("/etc/passwd".as_bytes());
         let cmd = KittyCommand {
             format: Format::Rgba,
             medium: Medium::TempFile,
@@ -845,11 +885,39 @@ mod tests {
             ..Default::default()
         };
 
-        let err = decode_payload(&cmd, &cmd.payload).unwrap_err();
-        assert!(
-            matches!(err, DecodeError::PathTraversal(_)),
-            "expected PathTraversal error, got: {err}"
-        );
+        assert!(decode_payload(&cmd, &cmd.payload).is_err());
+    }
+
+    #[test]
+    fn decode_tempfile_rejects_traversal_via_relative_dotdot() {
+        // ../etc/passwd joined with temp_dir resolves outside temp dir → rejected.
+        let path_b64 = BASE64.encode("../etc/passwd".as_bytes());
+        let cmd = KittyCommand {
+            format: Format::Rgba,
+            medium: Medium::TempFile,
+            width: 1,
+            height: 1,
+            payload: path_b64.into_bytes(),
+            ..Default::default()
+        };
+
+        assert!(decode_payload(&cmd, &cmd.payload).is_err());
+    }
+
+    #[test]
+    fn decode_tempfile_rejects_traversal_via_absolute_dotdot() {
+        // /tmp/foo/../../etc/passwd resolves to /etc/passwd → rejected.
+        let path_b64 = BASE64.encode("/tmp/foo/../../etc/passwd".as_bytes());
+        let cmd = KittyCommand {
+            format: Format::Rgba,
+            medium: Medium::TempFile,
+            width: 1,
+            height: 1,
+            payload: path_b64.into_bytes(),
+            ..Default::default()
+        };
+
+        assert!(decode_payload(&cmd, &cmd.payload).is_err());
     }
 
     #[test]
@@ -1080,34 +1148,4 @@ mod tests {
         }
     }
 
-    // ── validate_temp_path unit tests ──────────────────────────────────
-
-    #[test]
-    fn validate_temp_path_simple_filename() {
-        assert!(validate_temp_path("image.png").is_ok());
-    }
-
-    #[test]
-    fn validate_temp_path_subdir() {
-        assert!(validate_temp_path("subdir/image.png").is_ok());
-    }
-
-    #[test]
-    fn validate_temp_path_dot_component() {
-        // Current-dir "." is harmless.
-        assert!(validate_temp_path("./image.png").is_ok());
-    }
-
-    #[test]
-    fn validate_temp_path_rejects_parent() {
-        assert!(validate_temp_path("..").is_err());
-        assert!(validate_temp_path("../image.png").is_err());
-        assert!(validate_temp_path("a/../b").is_err());
-    }
-
-    #[test]
-    fn validate_temp_path_rejects_absolute() {
-        assert!(validate_temp_path("/etc/passwd").is_err());
-        assert!(validate_temp_path("/tmp/file").is_err());
-    }
 }
